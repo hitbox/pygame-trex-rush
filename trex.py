@@ -7,6 +7,7 @@ from itertools import cycle
 
 import pygame as pg
 
+pg.mixer.pre_init(44100, -16, 2, 2048)
 pg.init()
 
 clock = pg.time.Clock()
@@ -14,7 +15,7 @@ clock = pg.time.Clock()
 font = pg.font.Font(None, 128)
 
 FRAMERATE = 60
-SPRITE_SHEET = pg.image.load('sprites.png')
+SPRITE_SHEET = pg.image.load('images/sprites.png')
 
 def cell(x,y,w,h):
     return SPRITE_SHEET.subsurface(pg.Rect(x,y,w,h))
@@ -24,10 +25,12 @@ def random_choice_iter(possible):
         yield random.choice(possible)
 
 SHEET_TREX = {
-    'idle': cell(1338,2,88,94),
-    'blink': cell(1426,2,88,94),
+    'idle': [cell(1338,2,88,94)],
+    'blink': [cell(1426,2,88,94)],
+    'dead': [cell(1684,147,88,94)],
     'running': [cell(1514,2,88,94), cell(1602,2,88,94)],
     'crouch': [cell(1866,36,118,60), cell(1984,36,118,60)],
+    'jumping': [cell(2113,2,88,77)],
 }
 
 SHEET_GROUND = {
@@ -58,9 +61,27 @@ SHEET_DACTYL = {
     'dactyl': [cell(260,14,92,68), cell(352,2,92,60)]
 }
 
+SHEET_TEXT = {
+    'gameover': cell(2225,10,225,58),
+    'logo': cell(2217,72,230,31),
+    '0': cell(28,147,68,88),
+    '1': cell(95,147,43,88),
+    '2': cell(138,147,71,88),
+    '3': cell(208,147,68,88),
+    '4': cell(275,147,68,88),
+    '5': cell(343,147,71,88),
+    '6': cell(413,147,68,88),
+    '7': cell(480,147,68,88),
+    '8': cell(548,147,68,88),
+    '9': cell(616,147,68,88),
+}
+
+jump_sound = pg.mixer.Sound('sounds/jump.wav')
+
 class shared(object):
 
-    pass
+    enable_enemies = True
+    shown_banner = False
 
 
 class Animation(object):
@@ -117,7 +138,9 @@ class Sprite(pg.sprite.Sprite):
             if hasattr(self.rect, name):
                 setattr(self.rect, name, value)
 
-        self.x, self.y = self.rect.midbottom
+        self.alignattr = 'midbottom'
+
+        self.x, self.y = getattr(self.rect, self.alignattr)
         self.vx, self.vy = 0, 0
         self.ax, self.ay = 0, 0
         self.jumping = False
@@ -128,13 +151,13 @@ class Sprite(pg.sprite.Sprite):
         if not self.jumping:
             self.ay = -1.56
             self.jumping = True
+            jump_sound.play()
 
     def land(self):
         self.logger.debug('land')
         self.jumping = False
         self.ax, self.ay = 0, 0
         self.vx, self.vy = 0, 0
-        self.x, self.y = self.rect.midbottom
 
     def update(self, dt):
         # gravity
@@ -147,7 +170,14 @@ class Sprite(pg.sprite.Sprite):
         self.vx += self.ax
         self.vy += self.ay
 
-        self.rect.midbottom = (self.x, self.y)
+        setattr(self.rect, self.alignattr, (self.x, self.y))
+
+
+class Cloud(Sprite):
+
+    def __init__(self, **spritekwargs):
+        spritekwargs.setdefault('image', SHEET_CLOUDS['cloud'])
+        super(Cloud, self).__init__(**spritekwargs)
 
 
 class Text(Sprite):
@@ -169,13 +199,14 @@ class Text(Sprite):
         super(Text, self).__init__(image=bigimage, **spritekwargs)
 
 
-class Logo(Text):
+class Logo(Sprite):
 
     def __init__(self, centerx, **spritekwargs):
-        super(Logo, self).__init__('T-Rex Rush', **spritekwargs)
+        spritekwargs.setdefault('image', SHEET_TEXT['logo'])
+        super(Logo, self).__init__(**spritekwargs)
         self.centerx = centerx
-        self.vx = 45
-        self.ax = -0.75
+        self.vx = 80
+        self.ax = -3.0
         self.state = 'slideon'
         self.elapsed = 0
 
@@ -190,35 +221,64 @@ class Logo(Text):
             self.elapsed += dt
             if self.elapsed > 1000:
                 self.state = 'slideoff'
-                self.vx = 15
-                self.ax = -0.3
+                self.vx = 40
+                self.ax = -3.0
         elif self.state == 'slideoff':
             if self.rect.right < shared.screen.rect.left:
                 self.kill()
         super(Logo, self).update(dt)
 
 
-class Score(Text):
+class Score(Sprite):
 
     def __init__(self, **spritekwargs):
-        super(Score, self).__init__('0'*4, **spritekwargs)
         self.value = 0
+        spritekwargs.setdefault('image', Surface((0,0)))
+        super(Score, self).__init__(**spritekwargs)
+
+        widest = max(SHEET_TEXT[c].get_rect().width for c in '0123456789')
+        self.rect = pg.Rect(0,0,widest*4,100)
+        self.rect.topright = shared.screen.rect.topright
+
         self.elapsed = 0
         self.delay = 1000
+
+    @property
+    def image(self):
+        s = '%04d' % self.value
+        images = [SHEET_TEXT[c] for c in s]
+        rects = [image.get_rect() for image in images]
+
+        bigrect = pg.Rect(0,0,sum(rect.width for rect in rects),max(rect.height for rect in rects))
+        surface = Surface(bigrect.size)
+
+        items = zip(images, rects)
+
+        prev = bigrect.copy()
+        prev.topright = bigrect.topleft
+        for image, rect in zip(images, rects):
+            rect.topleft = prev.topright
+            surface.blit(image, rect)
+            prev = rect
+
+        return surface
+
+    @image.setter
+    def image(self, value):
+        return
 
     def update(self, dt):
         self.elapsed += dt
         if self.elapsed >= self.delay:
             self.value += 1
             self.elapsed %= self.delay
-            self.image = font.render('%04d' % self.value, True, (255,255,255))
 
 
 class Dino(Sprite):
 
     def __init__(self, **kwargs):
-        self.animations = {'running': Animation(SHEET_TREX['running']),
-                           'crouch': Animation(SHEET_TREX['crouch'])}
+        self.animations = { state:Animation(SHEET_TREX[state])
+                            for state in ['running', 'crouch', 'jumping', 'dead']}
         self.state = 'running'
         super(Dino, self).__init__(image=Surface((0,0)), **kwargs)
 
@@ -238,6 +298,16 @@ class Dino(Sprite):
     def image(self, value):
         return
 
+    def land(self):
+        super(Dino, self).land()
+        self.state = 'running'
+        self.rect.bottom = shared.floor
+        self.x, self.y = getattr(self.rect, self.alignattr)
+
+    def stand(self):
+        if self.state != 'jumping':
+            self.land()
+
     @property
     def rect(self):
         return self.animation.rect
@@ -247,8 +317,12 @@ class Dino(Sprite):
         return
 
     def jump(self):
-        self.state = 'running'
-        super(Dino, self).jump()
+        if not self.jumping:
+            super(Dino, self).jump()
+            r = self.rect.copy()
+            self.state = 'jumping'
+            self.rect.midtop = r.midtop
+            self.x, self.y = getattr(self.rect, self.alignattr)
 
     def update(self, dt):
         self.animation.update(dt)
@@ -295,13 +369,14 @@ class Cloud(Sprite):
         super(Cloud, self).__init__(**spritekwargs)
 
 
-class GameOver(Text):
+class GameOver(Sprite):
 
     def __init__(self, centerx, **spritekwargs):
-        super(GameOver, self).__init__('Game Over\n(R)etry (Q)uit', **spritekwargs)
+        spritekwargs.setdefault('image', SHEET_TEXT['gameover'])
+        super(GameOver, self).__init__(**spritekwargs)
         self.centerx = centerx
-        self.vx = 45
-        self.ax = -0.75
+        self.vx = 80
+        self.ax = -3.0
 
     def update(self, dt):
         if self.vx < 0 and self.rect.centerx < self.centerx:
@@ -338,6 +413,30 @@ class Ground(Group):
                 sprite.x = sprite.rect.centerx
 
 
+class Sky(Group):
+
+    def __init__(self, *sprites):
+        super(Sky, self).__init__(*sprites)
+        self.elapsed = 0
+        self.random_delay = random_choice_iter([500,1000,2000,5000])
+        self.delay = next(self.random_delay)
+
+    def spawn(self):
+        cloud = Cloud(midleft=(shared.screen.rect.right,
+                               random.randint(shared.screen.rect.top,
+                                              shared.screen.rect.centery-50)))
+        cloud.vx = -random.randint(1,10)
+        self.add(cloud)
+
+    def update(self, dt):
+        super(Sky, self).update(dt)
+        self.elapsed += dt
+        if self.elapsed >= self.delay:
+            self.elapsed %= self.delay
+            self.delay = next(self.random_delay)
+            self.spawn()
+
+
 class Enemies(Group):
 
     def __init__(self, *sprites):
@@ -347,6 +446,8 @@ class Enemies(Group):
         self.delay = next(self.random_delay)
 
     def spawn(self):
+        if not shared.enable_enemies:
+            return
         if random.randrange(3) == 0:
             y = shared.floor - SHEET_TREX['running'][0].get_rect().height
             dactyl = Dactyl(midleft=(shared.screen.rect.right, y))
@@ -388,7 +489,9 @@ class Enemies(Group):
                 gameover = GameOver(shared.screen.rect.centerx, midright=shared.screen.rect.midleft)
                 shared.messages.add(gameover)
 
+                shared.dino.state = 'dead'
                 shared.dinomanager.enabled = False
+                shared.sky.enabled = False
                 shared.ground.enabled = False
                 shared.score.enabled = False
                 self.enabled = False
@@ -401,7 +504,6 @@ class DinoManager(Group):
         super(DinoManager, self).update(dt)
 
         if shared.dino.rect.bottom > shared.floor:
-            shared.dino.rect.bottom = shared.floor
             shared.dino.land()
 
 
@@ -421,24 +523,26 @@ def gameplay():
 
         pressed = pg.key.get_pressed()
 
-        if shared.logo.rect.right < shared.screen.rect.left:
+        if shared.logo.alive() and shared.logo.rect.right < shared.screen.rect.left:
             shared.logo.kill()
 
-        if pressed[pg.K_UP]:
-            shared.dino.jump()
-
-        if pressed[pg.K_DOWN]:
-            shared.dino.crouch()
-        else:
-            shared.dino.state = 'running'
+        if shared.dinomanager.enabled:
+            if pressed[pg.K_UP]:
+                shared.dino.jump()
+            elif pressed[pg.K_DOWN]:
+                shared.dino.crouch()
+            else:
+                shared.dino.stand()
 
         shared.messages.update(dt)
 
-        if shared.dinomanager.enabled:
-            shared.dinomanager.update(dt)
+        shared.dinomanager.update(dt)
 
         if shared.ground.enabled:
             shared.ground.update(dt)
+
+        if shared.sky.enabled:
+            shared.sky.update(dt)
 
         if shared.enemies.enabled:
             shared.enemies.update(dt)
@@ -450,6 +554,7 @@ def gameplay():
 
         shared.screen.surface.fill((200,200,200))
 
+        shared.sky.draw(shared.screen.surface)
         shared.ground.draw(shared.screen.surface)
         shared.enemies.draw(shared.screen.surface)
         shared.dinomanager.draw(shared.screen.surface)
@@ -466,8 +571,12 @@ def restart():
 
     shared.scrollspeed = 10
 
-    shared.logo = Logo(shared.screen.rect.centerx, midright=shared.screen.rect.midleft)
-    shared.messages = Group(shared.logo)
+    shared.messages = Group()
+
+    if not shared.shown_banner:
+        shared.logo = Logo(shared.screen.rect.centerx, midright=shared.screen.rect.midleft)
+        shared.messages.add(shared.logo)
+        shared.shown_banner = True
 
     shared.score = Group(Score(topright=shared.screen.rect.move(-25,25).topright))
 
@@ -476,6 +585,7 @@ def restart():
     shared.floor = shared.dino.rect.bottom
 
     shared.enemies = Enemies()
+    shared.sky = Sky()
 
     shared.ground = Ground()
 
@@ -487,7 +597,6 @@ def main():
     """
     T-Rex Rush in Pygame.
     """
-    # https://github.com/shivamshekhar/Chrome-T-Rex-Rush
     import argparse
 
     def sizetype(s):
@@ -496,10 +605,14 @@ def main():
     parser = argparse.ArgumentParser(description=main.__doc__)
     parser.add_argument('--debug', action='store_true', help='Debug logging. [%(default)s].')
     parser.add_argument('--screen', type=sizetype, default=(1024,400), help='Screen size. [%(default)s].')
+    parser.add_argument('--disable-enemies', action='store_true', help='Don\'t generate enemies. [%(default)s].')
     args = parser.parse_args()
 
     if args.debug:
         logging.basicConfig(level=logging.DEBUG)
+
+    if args.disable_enemies:
+        shared.enable_enemies = False
 
     pg.display.set_mode(args.screen)
 
