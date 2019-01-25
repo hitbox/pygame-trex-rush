@@ -1,200 +1,156 @@
+import argparse
+import contextlib
+import copy
+import json
 import logging
 import math
 import os
 import random
+from pathlib import Path
 
 from itertools import cycle
 
-import pygame as pg
+with contextlib.redirect_stdout(open(os.devnull, "w")):
+    import pygame as pg
 
-pg.mixer.pre_init(44100, -16, 2, 2048)
-pg.init()
-
-clock = pg.time.Clock()
-
+SCENE_EVENT = pg.USEREVENT
+SCREEN_SIZE = (1024, 400)
 FRAMERATE = 60
-SPRITE_SHEET = pg.image.load('images/sprites.png')
+SCROLL_STEP = -6.0
+SPRITE_SHEET_FILENAME = 'images/sprites.png'
+SPRITE_SHEET = None
+SPRITE_CELLS_FILENAME = 'cells.json'
+SPRITE_CELLS = None
 
-def cell(x, y, w, h):
+def init():
+    global SPRITE_SHEET, SPRITE_CELLS
+    SPRITE_CELLS = json.load(open(SPRITE_CELLS_FILENAME))
+    SPRITE_SHEET = pg.image.load(SPRITE_SHEET_FILENAME)
+    SPRITE_CELLS = {
+        key: {
+            cellkey: SPRITE_SHEET.subsurface(pg.Rect(*rectargs))
+            for cellkey, rectargs in subdict.items()
+        }
+        for key, subdict in SPRITE_CELLS.items()
+    }
+
+def get_spritecell(x, y, w, h):
     return SPRITE_SHEET.subsurface(pg.Rect(x, y, w, h))
 
 def random_choice_iter(possible):
     while True:
         yield random.choice(possible)
 
-IMAGES = {
-    'trex': {
-        'idle':    [ cell(1338,2,88,94) ], # unused
-        'blink':   [ cell(1426,2,88,94) ], # unused
-        'dead':    [ cell(1684,147,88,94) ],
-        'running': [ cell(1514,2,88,94), cell(1602,2,88,94) ],
-        'crouch':  [ cell(1866,36,118,60), cell(1984,36,118,60) ],
-        'jumping': [ cell(2113,2,88,77) ],
-    },
-    'ground': {
-        'hump1':  cell(1459,104,33,26),
-        'dip1':   cell(1518,104,33,26),
-        'hump2':  cell(2101,104,33,26),
-        'hump3':  cell(2148,104,33,26),
-        'level1': cell(2,104,33,26),
-        'level1': cell(34,104,33,26),
-    },
-    'cacti': {
-        'cactus1':    cell(446,2,34,70),
-        'cactus2':    cell(514,2,34,70),
-        'cactus3':    cell(548,2,34,70),
-        'cactus4':    cell(582,2,34,70),
-        'cactus5':    cell(616,2,34,70),
-        'bigcactus1': cell(652,2,50,100),
-        'bigcactus2': cell(702,2,48,100),
-        'bigcactus3': cell(752,2,50,100),
-    },
-    'clouds': {
-        'cloud': cell(166,2,92,27),
-    },
-    'dactyl': {
-        'dactyl': [ cell(260,14,92,68), cell(352,2,92,60) ],
-    },
-    'text': {
-        'gameover': cell(737,143,663,162),
-        'logo':     cell(710,326,684,87),
-        '0':        cell(28,147,68,88),
-        '1':        cell(95,147,43,88),
-        '2':        cell(138,147,71,88),
-        '3':        cell(208,147,68,88),
-        '4':        cell(275,147,68,88),
-        '5':        cell(343,147,71,88),
-        '6':        cell(413,147,68,88),
-        '7':        cell(480,147,68,88),
-        '8':        cell(548,147,68,88),
-        '9':        cell(616,147,68,88),
-    },
-}
+class Animation:
 
-jump_sound = pg.mixer.Sound('sounds/jump.wav')
+    def __init__(self, images, repeat=1):
+        self.images = images
+        self.repeat = repeat
+        self._iter = cycle(self.images)
+        self._frame = next(self._iter)
+        self._repeat = self.repeat
 
-class shared(object):
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._repeat == 0:
+            self._repeat = self.repeat
+            self._frame = next(self._iter)
+        self._repeat -= 1
+        return self._frame
+
+
+class shared:
 
     enable_enemies = True
     shown_banner = False
+    screen = None
+    scrollspeed = None
+    messages = None
+    logo = None
+    shown_banner = None
+    score = None
+    dino = None
+    floor = None
+    enemies = None
+    sky = None
+    ground = None
+    logger = None
 
 
-class Frame(object):
+class Surface(pg.Surface):
 
-    def __init__(self, image, rect=None, mask=None):
+    def __init__(self, size, flags=pg.SRCALPHA):
+        super().__init__(size, flags=flags)
+
+
+class ImageSprite(pg.sprite.Sprite):
+
+    def __init__(self, image, *groups, position=None):
+        super().__init__(*groups)
         self.image = image
-        self.rect = rect or self.image.get_rect()
-        self.mask = mask or pg.mask.from_surface(self.image)
+        if position is None:
+            position = {}
+        self.rect = self.image.get_rect(**position)
 
 
-class Animation(object):
+class MovingTile(ImageSprite):
 
-    def __init__(self, images, delay=100):
-        self.frames = cycle(map(Frame, images))
-        self.frame = next(self.frames)
-        self.delay = delay
-        self.elapsed = 0
+    def __init__(self, image, *groups, position=None):
+        super().__init__(image, *groups, position=position)
+        self.x = self.rect.x
 
     def update(self, dt):
-        self.elapsed += dt
-        if self.elapsed >= self.delay:
-            self.elapsed = self.elapsed % self.delay
-            self.frame = next(self.frames)
+        self.x += SCROLL_STEP
+        self.rect.x = self.x
 
 
-def Surface(size):
-    return pg.Surface(size, pg.SRCALPHA)
+class GroundTile(MovingTile):
+    pass
 
-class ImageObject(object):
 
-    def __init__(self, surface):
-        self.surface = surface
-        self.rect = self.surface.get_rect()
+class Cactus(MovingTile):
 
+    def __init__(self, *groups, position=None):
+        cells = SPRITE_CELLS['cacti'].values()
+        image = random.choice(tuple(cells))
+        super().__init__(image, *groups, position=position)
+
+
+class Dactyl(MovingTile):
+
+    def __init__(self, *groups, position=None):
+        cells = SPRITE_CELLS['dactyl']
+        self.animation = Animation([cells['flying1'], cells['flying2']], repeat=8)
+        super().__init__(next(self.animation), *groups, position=position)
+
+    def update(self, dt):
+        super().update(dt)
+        self.image = next(self.animation)
+
+
+EnemyClasses = [Cactus, Dactyl]
 
 class Sprite(pg.sprite.Sprite):
 
-    def __init__(self, **kwargs):
-        super(Sprite, self).__init__()
-
-        assert 'image' in kwargs or 'size' in kwargs
-
-        if 'image' in kwargs:
-            image = kwargs['image']
-        else:
-            image = Surface(kwargs['size'])
-        self.image = image
-        self.mask = pg.mask.from_surface(self.image)
-
-        if 'fill' in kwargs:
-            self.image.fill(kwargs['fill'])
-
-        self.rect = self.image.get_rect()
-
+    def __init__(self, *groups, position=None):
+        super().__init__(*groups)
         self.enabled = True
-
-        for name,value in kwargs.items():
-            if hasattr(self.rect, name):
-                setattr(self.rect, name, value)
-
-        self.alignattr = 'midbottom'
-
-        self.x, self.y = getattr(self.rect, self.alignattr)
-        self.vx, self.vy = 0, 0
-        self.ax, self.ay = 0, 0
-        self.jumping = False
-
-        self.logger = logging.getLogger('trex')
-
-    def jump(self):
-        if not self.jumping:
-            self.ay = -1.56
-            self.jumping = True
-            jump_sound.play()
-
-    def land(self):
-        self.logger.debug('%s: land', self)
-        self.jumping = False
-        self.stop()
-
-    def stop(self):
-        self.jumping = False
-        self.ax, self.ay = 0, 0
-        self.vx, self.vy = 0, 0
-
-    def update(self, dt):
-        shared.logger.debug('%s: update', self)
-        # gravity
-        if self.jumping:
-            self.ay += .115
-
-        self.x += self.vx
-        self.y += self.vy
-
-        self.vx += self.ax
-        self.vy += self.ay
-
-        self.update_rect2xy()
-
-    def update_rect2xy(self):
-        setattr(self.rect, self.alignattr, (self.x, self.y))
-
-    def update_xy2rect(self):
-        self.x, self.y = getattr(self.rect, self.alignattr)
 
 
 class Cloud(Sprite):
 
     def __init__(self, **spritekwargs):
-        spritekwargs.setdefault('image', IMAGES['clouds']['cloud'])
-        super(Cloud, self).__init__(**spritekwargs)
+        spritekwargs.setdefault('image', SPRITE_CELLS['clouds']['cloud'])
+        super().__init__(**spritekwargs)
 
 
 class Logo(Sprite):
 
     def __init__(self, centerx, **spritekwargs):
-        spritekwargs.setdefault('image', IMAGES['text']['logo'])
-        super(Logo, self).__init__(**spritekwargs)
+        spritekwargs.setdefault('image', SPRITE_CELLS['text']['logo'])
+        super().__init__(**spritekwargs)
         self.centerx = centerx
         self.vx = 80
         self.ax = -3.0
@@ -223,42 +179,43 @@ class Logo(Sprite):
             if self.rect.right < shared.screen.rect.left:
                 # logo is off screen, kill it
                 self.kill()
-        super(Logo, self).update(dt)
+        super().update(dt)
 
 
 class Score(Sprite):
 
-    def __init__(self, **spritekwargs):
+    def __init__(self, *groups, position=None):
+        super().__init__(*groups)
         self.value = 0
-        spritekwargs.setdefault('image', Surface((0,0)))
-        super(Score, self).__init__(**spritekwargs)
-
-        widest = max(IMAGES['text'][c].get_rect().width for c in '0123456789')
-        self.rect = pg.Rect(0,0,widest*4,100)
-        self.rect.topright = shared.screen.rect.topright
-
+        widest = max(SPRITE_CELLS['text'][c].get_rect().width for c in '0123456789')
+        self.rect = pg.Rect(0, 0, widest*4, 100)
+        if position:
+            for key, value in position.items():
+                setattr(self.rect, key, value)
         self.elapsed = 0
         self.delay = 1000
+        self._cache = {}
 
-    @property
-    def image(self):
-        s = '%04d' % self.value
-        images = [IMAGES['text'][c] for c in s]
+    def _update_cache(self, s):
+        images = [SPRITE_CELLS['text'][c] for c in s]
         rects = [image.get_rect() for image in images]
-
         bigrect = pg.Rect(0,0,sum(rect.width for rect in rects),max(rect.height for rect in rects))
         surface = Surface(bigrect.size)
-
         items = zip(images, rects)
-
         prev = bigrect.copy()
         prev.topright = bigrect.topleft
         for image, rect in zip(images, rects):
             rect.topleft = prev.topright
             surface.blit(image, rect)
             prev = rect
+        self._cache[s] = surface
 
-        return surface
+    @property
+    def image(self):
+        s = '%04d' % self.value
+        if not s in self._cache:
+            self._update_cache(s)
+        return self._cache[s]
 
     @image.setter
     def image(self, value):
@@ -268,14 +225,14 @@ class Score(Sprite):
         if not self.enabled:
             return
         shared.logger.debug('%s: update', self)
-        super(Score, self).update(dt)
+        super().update(dt)
         self.elapsed += dt
         if self.elapsed >= self.delay:
             self.value += 1
             self.elapsed %= self.delay
 
 
-class AnimatedMixin(object):
+class AnimatedMixin:
 
     @property
     def image(self):
@@ -302,91 +259,95 @@ class AnimatedMixin(object):
         return
 
 
-class Dino(Sprite, AnimatedMixin):
+class DinoState:
 
-    def __init__(self, **kwargs):
-        self.animations = { state:Animation(IMAGES['trex'][state])
-                            for state in ('running', 'crouch', 'jumping',
-                                          'dead') }
-        self.state = 'running'
-        super(Dino, self).__init__(image=Surface((0,0)), **kwargs)
+    def __init__(self, dino):
+        self.dino = dino
 
-    @property
-    def animation(self):
-        return self.animations[self.state]
 
-    def crouch(self):
-        if not self.jumping:
-            self.state = 'crouch'
+class DinoRunning(DinoState):
 
-    def land(self):
-        super(Dino, self).land()
-        self.state = 'running'
-        self.rect.bottom = shared.floor
-        self.update_xy2rect()
+    def __init__(self, dino):
+        super().__init__(dino)
+        cells = SPRITE_CELLS['trex']
+        self.dino.animation = Animation([ cells['running1'], cells['running2'] ], repeat=8)
 
-    def stand(self):
-        if self.state != 'jumping':
-            self.land()
+    def update(self):
+        keys = pg.key.get_pressed()
+        if keys[pg.K_DOWN]:
+            return DinoCrouch(self.dino)
+        elif keys[pg.K_UP]:
+            return DinoJump(self.dino)
 
-    def jump(self):
-        if not self.jumping:
-            super(Dino, self).jump()
-            r = self.rect.copy()
-            self.state = 'jumping'
-            self.rect.midtop = r.midtop
-            self.update_xy2rect()
+
+class DinoCrouch(DinoState):
+
+    def __init__(self, dino):
+        super().__init__(dino)
+        cells = SPRITE_CELLS['trex']
+        self.dino.animation = Animation([ cells['crouch1'], cells['crouch2'] ], repeat=8)
+        self.restore = self.dino.rect.copy()
+        self.dino.rect = self.dino.animation.images[0].get_rect(bottomleft = self.dino.rect.bottomleft)
+
+    def update(self):
+        keys = pg.key.get_pressed()
+        if not keys[pg.K_DOWN]:
+            self.dino.rect = self.restore
+            return DinoRunning(self.dino)
+        elif keys[pg.K_UP]:
+            self.dino.rect = self.restore
+            return DinoJump(self.dino)
+
+
+class DinoJump(DinoState):
+
+    def __init__(self, dino):
+        super().__init__(dino)
+        cells = SPRITE_CELLS['trex']
+        self.dino.animation = Animation([ cells['jumping1'], cells['jumping2'] ], repeat=8)
+        self.y = self.floor = self.dino.rect.bottom
+        self.angle = 0
+        self.step = 0.07
+        self.height = 250
+
+    def update(self):
+        self.angle += self.step
+        if self.angle >= math.tau / 2:
+            self.dino.rect.bottom = self.floor
+            return DinoRunning(self.dino)
+        self.y = self.floor - math.sin(self.angle) * self.height
+        self.dino.rect.bottom = self.y
+
+
+class Dino(Sprite):
+
+    def __init__(self, *groups, position=None):
+        super().__init__(*groups)
+        self.state = DinoRunning(self)
+        self.image = next(self.animation)
+        if position is None:
+            position = {}
+        self.rect = self.image.get_rect(**position)
 
     def update(self, dt):
-        self.animation.update(dt)
-        super(Dino, self).update(dt)
-        if self.rect.bottom > shared.floor:
-            self.land()
-
-
-def random_ground_image():
-    return random.choice(list(IMAGES['ground'].values()))
-
-def random_cactus_image():
-    return random.choice(list(IMAGES['cacti'].values()))
-
-class GroundTile(Sprite):
-
-    def __init__(self, **spritekwargs):
-        spritekwargs.setdefault('image', random_ground_image())
-        super(GroundTile, self).__init__(**spritekwargs)
-
-
-class Cactus(Sprite):
-
-    def __init__(self, **spritekwargs):
-        spritekwargs.setdefault('image', random_cactus_image())
-        super(Cactus, self).__init__(**spritekwargs)
-
-
-class Dactyl(Sprite, AnimatedMixin):
-
-    def __init__(self, **spritekwargs):
-        self.animation = Animation(IMAGES['dactyl']['dactyl'])
-        super(Dactyl, self).__init__(image=Surface((0,0)), **spritekwargs)
-
-    def update(self, dt):
-        self.animation.update(dt)
-        super(Dactyl, self).update(dt)
+        newstate = self.state.update()
+        if newstate:
+            self.state = newstate
+        self.image = next(self.animation)
 
 
 class Cloud(Sprite):
 
     def __init__(self, **spritekwargs):
-        spritekwargs.setdefault('image', IMAGES['clouds']['cloud'])
-        super(Cloud, self).__init__(**spritekwargs)
+        spritekwargs.setdefault('image', SPRITE_CELLS['clouds']['cloud'])
+        super().__init__(**spritekwargs)
 
 
 class GameOver(Sprite):
 
     def __init__(self, centerx, **spritekwargs):
-        spritekwargs.setdefault('image', IMAGES['text']['gameover'])
-        super(GameOver, self).__init__(**spritekwargs)
+        spritekwargs.setdefault('image', SPRITE_CELLS['text']['gameover'])
+        super().__init__(**spritekwargs)
         self.centerx = centerx
         self.vx = 80
         self.ax = -3.0
@@ -396,24 +357,24 @@ class GameOver(Sprite):
             self.vx, self.vy = 0, 0
             self.ax, self.ay = 0, 0
             self.x = self.centerx
-        super(GameOver, self).update(dt)
+        super().update(dt)
 
 
 class Group(pg.sprite.Group):
 
     def __init__(self, *sprites):
-        super(Group, self).__init__(*sprites)
+        super().__init__(*sprites)
         self.enabled = True
 
     def update(self, dt):
         if self.enabled:
-            super(Group, self).update(dt)
+            super().update(dt)
 
 
 class Ground(Group):
 
     def __init__(self, *sprites):
-        super(Ground, self).__init__(*sprites)
+        super().__init__(*sprites)
 
         prev = shared.screen
         for _ in range(32):
@@ -424,7 +385,7 @@ class Ground(Group):
 
     def update(self, dt):
         if self.enabled:
-            super(Ground, self).update(dt)
+            super().update(dt)
             for sprite in self:
                 if sprite.rect.right < shared.screen.rect.left:
                     sprite.rect.left = max(sprite.rect.right for sprite in self)
@@ -434,7 +395,7 @@ class Ground(Group):
 class Sky(Group):
 
     def __init__(self, *sprites):
-        super(Sky, self).__init__(*sprites)
+        super().__init__(*sprites)
         self.elapsed = 0
         self.random_delay = random_choice_iter([500,1000,2000,5000])
         self.delay = next(self.random_delay)
@@ -448,7 +409,7 @@ class Sky(Group):
 
     def update(self, dt):
         if self.enabled:
-            super(Sky, self).update(dt)
+            super().update(dt)
             self.elapsed += dt
             if self.elapsed >= self.delay:
                 self.elapsed %= self.delay
@@ -459,7 +420,7 @@ class Sky(Group):
 class Enemies(Group):
 
     def __init__(self, *sprites):
-        super(Enemies, self).__init__(*sprites)
+        super().__init__(*sprites)
         self.elapsed = 0
         self.random_delay = random_choice_iter([750, 1000])
         self.delay = next(self.random_delay)
@@ -468,7 +429,7 @@ class Enemies(Group):
         if not shared.enable_enemies:
             return
         if random.randrange(3) == 0:
-            y = shared.floor - IMAGES['trex']['running'][0].get_rect().height
+            y = shared.floor - SPRITE_CELLS['trex']['running'][0].get_rect().height
             dactyl = Dactyl(midleft=(shared.screen.rect.right, y))
             dactyl.vx = -shared.scrollspeed
             self.add(dactyl)
@@ -493,7 +454,7 @@ class Enemies(Group):
     def update(self, dt):
         if not self.enabled:
             return
-        super(Enemies, self).update(dt)
+        super().update(dt)
 
         self.elapsed += dt
         if self.elapsed >= self.delay:
@@ -501,13 +462,13 @@ class Enemies(Group):
             self.delay = next(self.random_delay)
             self.spawn()
 
-        for sprite in self:
-            if (sprite.rect.right < shared.screen.rect.left - 25):
-                sprite.kill()
+        for enemy in self:
+            if (enemy.rect.right < shared.screen.rect.left):
+                enemy.kill()
 
-        for sprite in self:
-            if (sprite.rect.colliderect(shared.dino.rect)
-                    and pg.sprite.collide_mask(sprite, shared.dino)):
+        for enemy in self:
+            if (enemy.rect.colliderect(shared.dino.rect)
+                    and pg.sprite.collide_mask(enemy, shared.dino)):
 
                 gameover = GameOver(shared.screen.rect.centerx, midright=shared.screen.rect.midleft)
                 shared.messages.add(gameover)
@@ -551,6 +512,7 @@ def gameplay():
         shared.score.update(dt)
 
     while running:
+        dt = clock.tick(FRAMERATE)
         for event in pg.event.get():
             if event.type == pg.QUIT:
                 running = False
@@ -578,58 +540,199 @@ def gameplay():
         draw()
         pg.display.flip()
 
-        dt = clock.tick(FRAMERATE)
+class Clock:
 
-def restart():
-    shared.screen = ImageObject(pg.display.get_surface())
+    def __init__(self, framerate):
+        self.framerate = framerate
+        self._clock = pg.time.Clock()
 
-    shared.scrollspeed = 10
+    def tick(self):
+        return self._clock.tick(self.framerate)
 
-    shared.messages = Group()
 
-    if not shared.shown_banner:
-        shared.logo = Logo(shared.screen.rect.centerx, midright=shared.screen.rect.midleft)
-        shared.messages.add(shared.logo)
-        shared.shown_banner = True
+class Screen:
 
-    shared.score = Group(Score(topright=shared.screen.rect.move(-25,25).topright))
+    def __init__(self, size):
+        self.surface = pg.display.set_mode(size)
+        self.background = self.surface.copy()
+        self.rect = self.surface.get_rect()
 
-    shared.dino = Dino(bottomleft=shared.screen.rect.move(100, -12).bottomleft)
-    shared.floor = shared.dino.rect.bottom
+    def clear(self):
+        self.surface.blit(self.background, (0, 0))
 
-    shared.enemies = Enemies()
-    shared.sky = Sky()
 
-    shared.ground = Ground()
+class Scene:
 
-    shared.logger = logging.getLogger()
+    def __init__(self, engine):
+        self.engine = engine
+        self.eventdispatch = {}
 
-    gameplay()
+    def draw(self, surface):
+        pass
 
-def main():
+    def enter(self):
+        pass
+
+    def exit(self):
+        pass
+
+    def update(self, dt):
+        pass
+
+
+class TestScene(Scene):
+
+    def enter(self):
+        print('enter')
+        self.elapsed = 0
+
+    def update(self, dt):
+        self.elapsed += dt
+        if self.elapsed > 1000:
+            pg.event.post(pg.event.Event(SCENE_EVENT, method='pop', args=tuple()))
+
+
+def rendertext(s, size, color):
+    font = pg.font.Font(None, size)
+    image = font.render(s, True, color)
+    return image
+
+class MainMenu(Scene):
+
+    def __init__(self, engine):
+        super().__init__(engine)
+        self.sprites = pg.sprite.Group()
+        size = 130
+        color = (13, 35, 52)
+        sprite1 = ImageSprite(rendertext('TREX-RUSH', size, color),
+                self.sprites,
+                position=dict(center=self.engine.screen.rect.center))
+        sprite2 = ImageSprite(rendertext('PRESS ENTER START', size, color),
+                self.sprites,
+                position=dict(midtop=sprite1.rect.midbottom))
+        self.eventdispatch[pg.KEYDOWN] = self.on_keydown
+
+    def draw(self, surface):
+        self.sprites.draw(surface)
+
+    def on_keydown(self, event):
+        if event.key == pg.K_ESCAPE:
+            pg.event.post(pg.event.Event(pg.QUIT))
+        elif event.key == pg.K_RETURN:
+            self.engine.scene = Gameplay(self.engine)
+
+    def update(self, dt):
+        self.sprites.update(dt)
+
+
+class Gameplay(Scene):
+
+    def __init__(self, engine):
+        super().__init__(engine)
+        self.eventdispatch[pg.KEYDOWN] = self.on_keydown
+        self.sprites = pg.sprite.Group()
+        self.dino = Dino(position=dict(bottomleft=(200, 350)))
+        self.floor = self.dino.rect.bottom
+        self.sprites.add(self.dino)
+        x = 0
+        tiles = tuple(SPRITE_CELLS['ground'].values())
+        n = self.engine.screen.rect.width // SPRITE_CELLS['ground']['hump1'].get_width()
+        for _ in range(n * 2):
+            sprite = GroundTile(random.choice(tiles), position=dict(x=x, top=self.floor))
+            self.sprites.add(sprite)
+            x += sprite.rect.width
+        self.spawn = 0
+        self.reset_spawn()
+
+    def reset_spawn(self):
+        self.spawn = random.choice([60, 75, 90, 120])
+
+    def draw(self, surface):
+        self.sprites.draw(surface)
+
+    def draw_rects(self):
+        for sprite in self.sprites:
+            pg.draw.rect(surface, (200, 0, 0), sprite.rect, 2)
+
+    def on_keydown(self, event):
+        if event.key == pg.K_ESCAPE:
+            pg.event.post(pg.event.Event(pg.QUIT))
+            self.engine.scene = MainMenu(self.engine)
+
+    def update(self, dt):
+        self.sprites.update(dt)
+        groundtiles = tuple(sprite for sprite in self.sprites if isinstance(sprite, GroundTile))
+        right = max(tile.rect.right for tile in groundtiles)
+        for tile in groundtiles:
+            if tile.rect.right < self.engine.screen.rect.left:
+                tile.rect.left = right
+                tile.x = tile.rect.x
+        self.spawn -= 1
+        if self.spawn == 0:
+            class_ = random.choice(EnemyClasses)
+            position = dict(left = self.engine.screen.rect.right, bottom = self.floor)
+            self.sprites.add(class_(position=position))
+            self.reset_spawn()
+
+
+class Engine:
+
+    def __init__(self, clock, screen):
+        self.clock = clock
+        self.screen = screen
+        #: external interface to change scene
+        self.scene = None
+        #: the real, current scene
+        self._scene = None
+
+    def run(self, scene):
+        self._scene = self.scene = scene
+        while not pg.event.peek(pg.QUIT):
+            self.step()
+
+    def step(self):
+        dt = self.clock.tick()
+        for event in pg.event.get():
+            if event.type in self._scene.eventdispatch:
+                self._scene.eventdispatch[event.type](event)
+        self._scene.update(dt)
+        self.screen.clear()
+        self._scene.draw(self.screen.surface)
+        pg.display.flip()
+        if self.scene is not self._scene:
+            self._scene.exit()
+            self._scene = self.scene
+            self._scene.enter()
+
+
+def main(argv=None):
     """
     T-Rex Rush in Pygame.
     """
-    import argparse
-
     def sizetype(s):
-        return tuple(map(int, s.strip('()').split(',')))
+        return tuple(map(int, s.split(',')))
 
-    parser = argparse.ArgumentParser(description=main.__doc__)
-    parser.add_argument('--debug', action='store_true', help='Debug logging. [%(default)s].')
-    parser.add_argument('--screen', type=sizetype, default=(1024,400), help='Screen size. [%(default)s].')
-    parser.add_argument('--disable-enemies', action='store_true', help='Don\'t generate enemies. [%(default)s].')
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(prog=Path(__file__).stem, description=main.__doc__)
+    parser.add_argument('--debug', action='store_true', help='Debug logging [%(default)s].')
+    parser.add_argument('--framerate', type=int, default=FRAMERATE, help='Framerate [%(default)s].')
+    parser.add_argument('--screen', type=sizetype, default=SCREEN_SIZE, help='Screen size [%(default)s].')
+    args = parser.parse_args(argv)
 
     if args.debug:
         logging.basicConfig(level=logging.DEBUG)
 
-    if args.disable_enemies:
-        shared.enable_enemies = False
+    pg.mixer.pre_init(44100, -16, 2, 2048)
+    npass, nfail = pg.init()
+    init()
 
-    pg.display.set_mode(args.screen)
+    clock = Clock(args.framerate)
+    screen = Screen(args.screen)
+    screen.background.fill((200,200,200))
+    engine = Engine(clock, screen)
 
-    restart()
+    scene = MainMenu(engine)
+    scene = Gameplay(engine)
+    engine.run(scene)
 
 if __name__ == '__main__':
     main()
